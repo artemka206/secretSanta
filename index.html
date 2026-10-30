@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Porter Secret Santa</title>
+    <style>
+        :root {
+            --primary-color: #c0392b;
+            --secondary-color: #2c3e50;
+            --bg-color: #f5f6fa;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--secondary-color);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            width: 100%;
+            max-width: 450px;
+            text-align: center;
+        }
+        h1 { color: var(--primary-color); margin-bottom: 10px; }
+        p { color: #7f8c8d; font-size: 14px; }
+        input, select, button, textarea {
+            width: 100%;
+            padding: 12px;
+            margin: 10px 0;
+            border: 1px solid #dcdde1;
+            border-radius: 6px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        button:hover { background-color: #a93226; }
+        .hidden { display: none; }
+        .result-box {
+            background: #eaf2f8;
+            border: 2px dashed #3498db;
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 20px;
+            font-size: 18px;
+            font-weight: bold;
+            color: #2980b9;
+        }
+        .admin-panel {
+            margin-top: 30px;
+            border-top: 1px solid #eee;
+            padding-top: 20px;
+            text-align: left;
+        }
+        textarea { height: 85px; resize: vertical; }
+        .link-box {
+            background: #e8f8f5;
+            border: 1px solid #27ae60;
+            padding: 10px;
+            border-radius: 6px;
+            word-break: break-all;
+            font-size: 13px;
+            margin-top: 10px;
+            color: #27ae60;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🎁 Porter Secret Santa</h1>
+    <p>Узнай, кому ты будешь дарить новогодний подарок!</p>
+
+    <!-- Participant Section -->
+    <div id="participantSection" class="hidden">
+        <label for="participantSelect">Выбери свое имя:</label>
+        <select id="participantSelect">
+            <option value="">-- Выберите себя --</option>
+        </select>
+        <button onclick="revealRecipient()">Узнать имя подопечного</button>
+    </div>
+
+    <!-- Result Section -->
+    <div id="resultSection" class="hidden">
+        <div class="result-box" id="resultText"></div>
+        <p style="margin-top: 15px; font-size: 12px;">Сохрани имя в тайне! Никому не рассказывай.</p>
+    </div>
+
+    <!-- Setup Notice (if no data in URL) -->
+    <div id="setupNotice" class="hidden">
+        <p style="color: #c0392b; font-weight: bold;">Жеребьевка еще не проведена!</p>
+    </div>
+
+    <!-- Admin Panel -->
+    <div class="admin-panel" id="adminPanel">
+        <h3>Панель организатора</h3>
+        <label for="namesInput">Участники (каждый с новой строки):</label>
+        <textarea id="namesInput" placeholder="Артем&#10;Максим&#10;Анна&#10;Олег">Артем
+Максим
+Анна
+Олег
+Ирина</textarea>
+        <button onclick="generateAndGetLink()">Сгенерировать ссылку для команды</button>
+        <div id="linkOutput" class="hidden">
+            <p style="margin: 5px 0 0 0; font-weight: bold; color: #2c3e50;">Готовая ссылка для сотрудников:</p>
+            <div class="link-box" id="generatedLinkText"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+    let globalPairs = {};
+
+    // Decode pairs from URL hash on load
+    window.onload = function() {
+        const hash = window.location.hash.substring(1);
+        if (hash) {
+            try {
+                const decodedJson = atob(hash);
+                globalPairs = JSON.parse(decodedJson);
+                
+                // If pairs exist, show participant dropdown and hide generator input
+                const participants = Object.keys(globalPairs);
+                const select = document.getElementById('participantSelect');
+                select.innerHTML = '<option value="">-- Выберите себя --</option>';
+                participants.forEach(name => {
+                    const option = document.createElement('option');
+                    option.value = name;
+                    option.textContent = name;
+                    select.appendChild(option);
+                });
+
+                document.getElementById('participantSection').classList.remove('hidden');
+                document.getElementById('setupNotice').classList.add('hidden');
+                // Keep admin panel accessible just in case, or hide it if you want strictness
+            } catch (e) {
+                console.error('Invalid link data', e);
+                showSetupError();
+            }
+        } else {
+            showSetupError();
+        }
+    };
+
+    function showSetupError() {
+        document.getElementById('setupNotice').classList.remove('hidden');
+        document.getElementById('participantSection').classList.add('hidden');
+    }
+
+    function generateAndGetLink() {
+        const text = document.getElementById('namesInput').value;
+        const names = text.split('\n').map(n => n.trim()).filter(n => n.length > 0);
+
+        if (names.length < 3) {
+            alert('Нужно минимум 3 участника для игры!');
+            return;
+        }
+
+        // Shuffle and pair generation algorithm
+        let givers = [...names];
+        let receivers = [...names];
+        let success = false;
+        let pairs = {};
+
+        while (!success) {
+            receivers.sort(() => Math.random() - 0.5);
+            success = true;
+            pairs = {};
+
+            for (let i = 0; i < givers.length; i++) {
+                if (givers[i] === receivers[i]) {
+                    success = false;
+                    break;
+                }
+                pairs[givers[i]] = receivers[i];
+            }
+        }
+
+        // Encode pairs into Base64 for URL hash
+        const jsonString = JSON.stringify(pairs);
+        const encodedData = btoa(unescape(encodeURIComponent(jsonString)));
+        
+        const baseUrl = window.location.href.split('#')[0];
+        const finalUrl = `${baseUrl}#${encodedData}`;
+
+        // Display link to admin
+        document.getElementById('linkOutput').classList.remove('hidden');
+        document.getElementById('generatedLinkTexttextContent', finalUrl);
+        document.getElementById('generatedLinkText').innerText = finalUrl;
+    }
+
+    function revealRecipient() {
+        const name = document.getElementById('participantSelect').value;
+        if (!name) {
+            alert('Пожалуйста, выберите свое имя из списка.');
+            return;
+        }
+
+        const recipient = globalPairs[name];
+        if (recipient) {
+            document.getElementById('participantSection').classList.add('hidden');
+            document.getElementById('resultSection').classList.remove('hidden');
+            document.getElementById('resultText').innerHTML = `Твой подопечный:<br><span style="font-size: 24px; color: #c0392b;">${recipient}</span>`;
+        } else {
+            alert('Ошибка: имя не найдено в этой ссылке.');
+        }
+    }
+</script>
+
+</body>
+</html>

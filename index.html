@@ -61,6 +61,15 @@
             font-weight: bold;
             color: #2980b9;
         }
+        .warning-box {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 6px;
+            margin-top: 15px;
+            font-weight: bold;
+        }
         .admin-panel {
             margin-top: 30px;
             border-top: 1px solid #eee;
@@ -101,6 +110,11 @@
         <p style="margin-top: 15px; font-size: 12px;">Сохрани имя в тайне! Никому не рассказывай.</p>
     </div>
 
+    <!-- Device Locked Warning -->
+    <div id="deviceLockedSection" class="hidden">
+        <div class="warning-box" id="lockedMessage"></div>
+    </div>
+
     <!-- Setup Notice (if no data in URL) -->
     <div id="setupNotice" class="hidden">
         <p style="color: #c0392b; font-weight: bold;">Жеребьевка еще не проведена!</p>
@@ -126,7 +140,6 @@
 <script>
     let globalPairs = {};
 
-    // Decode pairs from URL hash on load
     window.onload = function() {
         const hash = window.location.hash.substring(1);
         if (hash) {
@@ -134,7 +147,23 @@
                 const decodedJson = atob(hash);
                 globalPairs = JSON.parse(decodedJson);
                 
-                // If pairs exist, show participant dropdown and hide generator input
+                // Check if this specific browser/device has already revealed a name
+                const alreadyUsedName = localStorage.getItem('porter_santa_user');
+                const savedRecipient = localStorage.getItem('porter_santa_recipient');
+
+                if (alreadyUsedName && savedRecipient) {
+                    // Lock device and show what was previously opened here
+                    document.getElementById('participantSection').classList.add('hidden');
+                    const lockedSection = document.getElementById('deviceLockedSection');
+                    lockedSection.classList.remove('hidden');
+                    document.getElementById('lockedMessage').innerHTML = 
+                        `⚠️ С этого устройства уже был выполнен просмотр!<br><br>` +
+                        `Участник: <b>${alreadyUsedName}</b><br>` +
+                        `Его подопечный: <span style="color: #c0392b; font-size: 20px;">${savedRecipient}</span>`;
+                    return;
+                }
+
+                // Otherwise, load participants into dropdown normally
                 const participants = Object.keys(globalPairs);
                 const select = document.getElementById('participantSelect');
                 select.innerHTML = '<option value="">-- Выберите себя --</option>';
@@ -147,7 +176,6 @@
 
                 document.getElementById('participantSection').classList.remove('hidden');
                 document.getElementById('setupNotice').classList.add('hidden');
-                // Keep admin panel accessible just in case, or hide it if you want strictness
             } catch (e) {
                 console.error('Invalid link data', e);
                 showSetupError();
@@ -171,7 +199,6 @@
             return;
         }
 
-        // Shuffle and pair generation algorithm
         let givers = [...names];
         let receivers = [...names];
         let success = false;
@@ -191,16 +218,13 @@
             }
         }
 
-        // Encode pairs into Base64 for URL hash
         const jsonString = JSON.stringify(pairs);
         const encodedData = btoa(unescape(encodeURIComponent(jsonString)));
         
         const baseUrl = window.location.href.split('#')[0];
         const finalUrl = `${baseUrl}#${encodedData}`;
 
-        // Display link to admin
         document.getElementById('linkOutput').classList.remove('hidden');
-        document.getElementById('generatedLinkTexttextContent', finalUrl);
         document.getElementById('generatedLinkText').innerText = finalUrl;
     }
 
@@ -213,6 +237,10 @@
 
         const recipient = globalPairs[name];
         if (recipient) {
+            // Save state to localStorage so this browser is locked to this user
+            localStorage.setItem('porter_santa_user', name);
+            localStorage.setItem('porter_santa_recipient', recipient);
+
             document.getElementById('participantSection').classList.add('hidden');
             document.getElementById('resultSection').classList.remove('hidden');
             document.getElementById('resultText').innerHTML = `Твой подопечный:<br><span style="font-size: 24px; color: #c0392b;">${recipient}</span>`;

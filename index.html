@@ -656,42 +656,20 @@
     </div>
   </div>
 
-  <!-- Firebase SDK та логіка гри -->
-  <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-    import {
-      getFirestore,
-      collection,
-      doc,
-      getDoc,
-      setDoc,
-      updateDoc,
-      deleteDoc,
-      onSnapshot,
-      writeBatch,
-      runTransaction
-    } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-
+  <script>
     // =========================================================================
-    // 1. КОНФІГУРАЦІЯ ТА ГЛОБАЛЬНИЙ СТАН ДОДАТКУ
+    // 1. CONFIGURATION & LOCAL STORAGE KEYS
     // =========================================================================
     const ADMIN_PASSWORD = "5641301";
-    const appId = typeof __app_id !== "undefined" ? __app_id : "porter-secret-santa";
-    const firebaseConfig = typeof __firebase_config !== "undefined" ? JSON.parse(__firebase_config) : null;
+    const STORAGE_KEYS = {
+      PARTICIPANTS: "porter_santa_participants_v1",
+      DEVICE_LOCK: "porter_santa_device_lock_v1"
+    };
 
-    let app = null;
-    let auth = null;
-    let db = null;
-    let currentUser = null;
-
-    // Стан даних у пам'яті
-    let participants = [];          // Повний список учасників із Firestore
-    let lockedSession = null;       // Зафіксована пара поточного пристрою { santaId, santaName, santaRole, santaStore, santaCode, receiverId, receiverName, receiverRole, receiverStore, lockedAt }
+    let participants = [];
+    let lockedSession = null;
     let isAdminAuthenticated = false;
-    let isSeedingInProgress = false;
 
-    // 6 реалістичних стартових учасників PORTER із готовими унікальними кодами
     const INITIAL_SAMPLE_PARTICIPANTS = [
       { id: "p_1024", code: "PRT-1024", role: "store", storeNumber: "1", fullName: "Коваленко Анна" },
       { id: "p_2048", code: "PRT-2048", role: "store", storeNumber: "1", fullName: "Мельник Дмитро" },
@@ -702,15 +680,8 @@
     ];
 
     // =========================================================================
-    // 2. АЛГОРИТМ САТТОЛО (ГАРАНТОВАНИЙ БЕЗКОНФЛІКТНИЙ РОЗПОДІЛ ПАР)
+    // 2. SATTOLO DERANGEMENT ALGORITHM (NO SELF-MATCHES)
     // =========================================================================
-    /**
-     * Генерує випадкову циклічну перестановку (derangement) за алгоритмом Саттоло.
-     * Гарантує для будь-якого N >= 2:
-     * 1) Кожен учасник має валідний receiverId;
-     * 2) Жоден учасник ніколи не випаде сам собі (santa.id !== receiver.id);
-     * 3) Кожен учасник отримає рівно один подарунок.
-     */
     function generateSattoloDerangement(rosterList, resetUsedStatus = true) {
       const n = rosterList.length;
       if (n < 2) {
@@ -718,14 +689,12 @@
           ...item,
           receiverId: "",
           used: resetUsedStatus ? false : Boolean(item.used),
-          usedAt: resetUsedStatus ? null : (item.usedAt || null),
-          usedByUid: resetUsedStatus ? null : (item.usedByUid || null)
+          usedAt: resetUsedStatus ? null : (item.usedAt || null)
         }));
       }
 
       const shuffled = [...rosterList];
       for (let i = n - 1; i > 0; i--) {
-        // Випадковий індекс j суворо менший за i (0 <= j < i)
         const j = Math.floor(Math.random() * i);
         const temp = shuffled[i];
         shuffled[i] = shuffled[j];
@@ -736,12 +705,10 @@
         ...item,
         receiverId: shuffled[idx].id,
         used: resetUsedStatus ? false : Boolean(item.used),
-        usedAt: resetUsedStatus ? null : (item.usedAt || null),
-        usedByUid: resetUsedStatus ? null : (item.usedByUid || null)
+        usedAt: resetUsedStatus ? null : (item.usedAt || null)
       }));
     }
 
-    // Генератор унікального персонального коду формату PRT-XXXX
     function generateUniqueSecretCode(existingCodesSet) {
       let code = "";
       let attempts = 0;
@@ -755,7 +722,7 @@
     }
 
     // =========================================================================
-    // 3. ДОПОМІЖНІ ФУНКЦІЇ ІНТЕРФЕЙСУ ТА ФОРМАТУВАННЯ
+    // 3. UI & FORMATTING HELPERS
     // =========================================================================
     function initSnowfall() {
       const container = document.getElementById("snow-container");
@@ -792,6 +759,16 @@
     }
 
     function copyTextToClipboard(text, successMsg = "Скопійовано! 📋") {
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => {
+          showToast(successMsg, "success");
+        }).catch(() => fallbackCopy(text, successMsg));
+      } else {
+        fallbackCopy(text, successMsg);
+      }
+    }
+
+    function fallbackCopy(text, successMsg) {
       const textarea = document.createElement("textarea");
       textarea.value = text;
       textarea.style.position = "fixed";
@@ -903,120 +880,95 @@
     }
 
     // =========================================================================
-    // 4. РОБОТА З FIRESTORE (АВТЕНТИФІКАЦІЯ, БЛОКУВАННЯ, СИНХРОНІЗАЦІЯ)
+    // 4. LOCAL STORAGE PERSISTENCE
     // =========================================================================
-    function getParticipantsColRef() {
-      return collection(db, "artifacts", appId, "public", "data", "participants_v2");
-    }
-
-    function getDeviceLockDocRef(uid) {
-      return doc(db, "artifacts", appId, "users", uid, "device_lock", "session");
-    }
-
-    // Завантаження збереженого блокування пристрою при старті або перезавантаженні сторінки
-    async function loadDeviceLockFromFirestore() {
-      if (!currentUser) return null;
-      try {
-        const snap = await getDoc(getDeviceLockDocRef(currentUser.uid));
-        if (snap.exists()) {
-          return snap.data();
+    function sortParticipantsList(list) {
+      return list.sort((a, b) => {
+        if (a.role !== b.role) return a.role === "store" ? -1 : 1;
+        if (a.role === "store") {
+          const nA = parseInt(a.storeNumber, 10);
+          const nB = parseInt(b.storeNumber, 10);
+          if (!isNaN(nA) && !isNaN(nB) && nA !== nB) return nA - nB;
+          if (a.storeNumber !== b.storeNumber) {
+            return String(a.storeNumber).localeCompare(String(b.storeNumber), "uk");
+          }
         }
-      } catch (err) {
-        console.error("Помилка читання блокування пристрою:", err);
-      }
-      return null;
+        return a.fullName.localeCompare(b.fullName, "uk");
+      });
     }
 
-    // Початкове наповнення бази 6 тестовими учасниками з кодами при першому відкритті
-    async function seedInitialSampleData() {
-      if (!currentUser || isSeedingInProgress) return;
-      isSeedingInProgress = true;
+    function saveParticipantsToStorage(list) {
+      participants = sortParticipantsList([...list]);
+      localStorage.setItem(STORAGE_KEYS.PARTICIPANTS, JSON.stringify(participants));
+      syncDeviceLockWithRoster();
+    }
+
+    function loadParticipantsFromStorage() {
       try {
-        const paired = generateSattoloDerangement(INITIAL_SAMPLE_PARTICIPANTS, true);
-        const batch = writeBatch(db);
-        paired.forEach((p) => {
-          batch.set(doc(getParticipantsColRef(), p.id), p);
-        });
-        await batch.commit();
-      } catch (err) {
-        console.error("Помилка ініціалізації стартового списку:", err);
-      } finally {
-        isSeedingInProgress = false;
-      }
-    }
-
-    // Підписка на оновлення колекції учасників у реальному часі
-    function startParticipantsListener() {
-      if (!currentUser) return;
-      const colRef = getParticipantsColRef();
-
-      onSnapshot(
-        colRef,
-        async (snapshot) => {
-          if (snapshot.empty) {
-            await seedInitialSampleData();
+        const raw = localStorage.getItem(STORAGE_KEYS.PARTICIPANTS);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            participants = sortParticipantsList(parsed);
             return;
           }
-
-          const list = [];
-          snapshot.forEach((docSnap) => {
-            list.push({ id: docSnap.id, ...docSnap.data() });
-          });
-
-          // Сортування: спочатку магазини за номером, потім менеджери за абеткою
-          list.sort((a, b) => {
-            if (a.role !== b.role) return a.role === "store" ? -1 : 1;
-            if (a.role === "store") {
-              const nA = parseInt(a.storeNumber, 10);
-              const nB = parseInt(b.storeNumber, 10);
-              if (!isNaN(nA) && !isNaN(nB) && nA !== nB) return nA - nB;
-              if (a.storeNumber !== b.storeNumber) {
-                return String(a.storeNumber).localeCompare(String(b.storeNumber), "uk");
-              }
-            }
-            return a.fullName.localeCompare(b.fullName, "uk");
-          });
-
-          participants = list;
-
-          // Якщо цей пристрій заблокований, перевіряємо чи адмін не скинув статус цього учасника
-          if (lockedSession && lockedSession.santaId) {
-            const liveSanta = participants.find((p) => p.id === lockedSession.santaId);
-            if (!liveSanta || liveSanta.used === false) {
-              // Адміністратор скинув статус або перемішав гру — розблоковуємо пристрій
-              lockedSession = null;
-              if (currentUser) {
-                deleteDoc(getDeviceLockDocRef(currentUser.uid)).catch(() => {});
-              }
-            } else if (liveSanta && liveSanta.receiverId) {
-              // Синхронізуємо актуального отримувача на випадок оновлення даних
-              const liveReceiver = participants.find((p) => p.id === liveSanta.receiverId);
-              if (liveReceiver) {
-                lockedSession = {
-                  ...lockedSession,
-                  santaName: liveSanta.fullName,
-                  santaRole: liveSanta.role,
-                  santaStore: liveSanta.storeNumber || "",
-                  receiverId: liveReceiver.id,
-                  receiverName: liveReceiver.fullName,
-                  receiverRole: liveReceiver.role,
-                  receiverStore: liveReceiver.storeNumber || ""
-                };
-              }
-            }
-          }
-
-          routeActiveView();
-        },
-        (error) => {
-          console.error("Помилка синхронізації бази:", error);
-          showToast("Помилка з'єднання з базою даних. Перевірте інтернет.", "error");
         }
-      );
+      } catch (err) {
+        console.error("Failed to read participants from localStorage:", err);
+      }
+
+      // Seed initial sample data on first launch
+      const seeded = generateSattoloDerangement(INITIAL_SAMPLE_PARTICIPANTS, true);
+      saveParticipantsToStorage(seeded);
+    }
+
+    function saveDeviceLockToStorage(session) {
+      lockedSession = session;
+      if (session) {
+        localStorage.setItem(STORAGE_KEYS.DEVICE_LOCK, JSON.stringify(session));
+      } else {
+        localStorage.removeItem(STORAGE_KEYS.DEVICE_LOCK);
+      }
+    }
+
+    function loadDeviceLockFromStorage() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEYS.DEVICE_LOCK);
+        if (raw) {
+          lockedSession = JSON.parse(raw);
+        }
+      } catch (err) {
+        console.error("Failed to read device lock from localStorage:", err);
+        lockedSession = null;
+      }
+    }
+
+    function syncDeviceLockWithRoster() {
+      if (!lockedSession || !lockedSession.santaId) return;
+
+      const liveSanta = participants.find((p) => p.id === lockedSession.santaId);
+      if (!liveSanta || liveSanta.used === false) {
+        saveDeviceLockToStorage(null);
+        return;
+      }
+
+      const liveReceiver = participants.find((p) => p.id === liveSanta.receiverId);
+      if (liveReceiver) {
+        saveDeviceLockToStorage({
+          ...lockedSession,
+          santaName: liveSanta.fullName,
+          santaRole: liveSanta.role,
+          santaStore: liveSanta.storeNumber || "",
+          receiverId: liveReceiver.id,
+          receiverName: liveReceiver.fullName,
+          receiverRole: liveReceiver.role,
+          receiverStore: liveReceiver.storeNumber || ""
+        });
+      }
     }
 
     // =========================================================================
-    // 5. ПЕРЕМИКАННЯ ЕКРАНІВ (МАРШРУТИЗАЦІЯ СТАНУ)
+    // 5. VIEW ROUTING
     // =========================================================================
     function routeActiveView() {
       const viewLoading = document.getElementById("view-loading");
@@ -1026,7 +978,6 @@
 
       viewLoading.classList.add("hidden");
 
-      // 1. Якщо відкрито панель адміністратора
       if (isAdminAuthenticated) {
         viewCodeEntry.classList.add("hidden");
         viewLocked.classList.add("hidden");
@@ -1037,7 +988,6 @@
 
       viewAdmin.classList.add("hidden");
 
-      // 2. Якщо на цьому пристрої вже активовано персональний код — показуємо ТІЛЬКИ заблокований екран
       if (lockedSession && lockedSession.receiverName) {
         viewCodeEntry.classList.add("hidden");
         viewLocked.classList.remove("hidden");
@@ -1045,13 +995,12 @@
         return;
       }
 
-      // 3. Інакше показуємо поле введення персонального коду
       viewLocked.classList.add("hidden");
       viewCodeEntry.classList.remove("hidden");
     }
 
     // =========================================================================
-    // 6. ПЕРЕВІРКА ТА АКТИВАЦІЯ ПЕРСОНАЛЬНОГО КОДУ (КЛЮЧОВА ЛОГІКА)
+    // 6. SECRET CODE VALIDATION & ACTIVATION
     // =========================================================================
     function showCodeError(message) {
       const box = document.getElementById("code-error-box");
@@ -1066,12 +1015,11 @@
       document.getElementById("code-error-box").classList.add("hidden");
     }
 
-    async function handleSecretCodeSubmit(e) {
+    function handleSecretCodeSubmit(e) {
       e.preventDefault();
       hideCodeError();
 
       const inputEl = document.getElementById("secret-code-input");
-      const submitBtn = document.getElementById("submit-code-btn");
       const enteredCode = inputEl.value.trim().toUpperCase();
       inputEl.value = enteredCode;
 
@@ -1081,128 +1029,68 @@
         return;
       }
 
-      if (!currentUser) {
-        showCodeError("⏳ Зачекайте секунду, встановлюється захищене з'єднання...");
-        return;
-      }
-
-      // Пошук учасника за введеним персональним кодом
-      const matchedSanta = participants.find(
+      const santaIndex = participants.findIndex(
         (p) => String(p.code || "").trim().toUpperCase() === enteredCode
       );
 
-      if (!matchedSanta) {
+      if (santaIndex === -1) {
         showCodeError("❌ Невірний код. Перевірте символи або зверніться до організатора.");
         inputEl.focus();
         return;
       }
 
-      // Якщо код вже був використаний
-      if (matchedSanta.used) {
-        // Якщо він був використаний саме цим користувачем (uid), відновлюємо його екран
-        if (matchedSanta.usedByUid === currentUser.uid) {
-          const rec = participants.find((p) => p.id === matchedSanta.receiverId);
-          if (rec) {
-            lockedSession = {
-              santaId: matchedSanta.id,
-              santaName: matchedSanta.fullName,
-              santaRole: matchedSanta.role,
-              santaStore: matchedSanta.storeNumber || "",
-              santaCode: matchedSanta.code,
-              receiverId: rec.id,
-              receiverName: rec.fullName,
-              receiverRole: rec.role,
-              receiverStore: rec.storeNumber || "",
-              lockedAt: matchedSanta.usedAt || new Date().toISOString()
-            };
-            await setDoc(getDeviceLockDocRef(currentUser.uid), lockedSession).catch(() => {});
-            routeActiveView();
-            return;
-          }
-        }
+      const matchedSanta = participants[santaIndex];
 
-        // Якщо код використаний на іншому пристрої
+      if (matchedSanta.used) {
         showCodeError(
-          "❌ Цей персональний код вже був використаний на іншому пристрої! Якщо це були не ви — негайно напишіть організатору."
+          "❌ Цей персональний код вже був використаний! Якщо це були не ви — зверніться до організатора."
         );
         return;
       }
 
-      // Атомарна транзакція: позначаємо код використаним, читаємо отримувача і зберігаємо блокування пристрою
-      submitBtn.disabled = true;
-      submitBtn.innerHTML = `<span>⏳ Відкриваємо вашу картку...</span>`;
-
-      try {
-        const santaDocRef = doc(getParticipantsColRef(), matchedSanta.id);
-        const receiverDocRef = doc(getParticipantsColRef(), matchedSanta.receiverId);
-        const lockDocRef = getDeviceLockDocRef(currentUser.uid);
-        const nowIso = new Date().toISOString();
-
-        const createdSession = await runTransaction(db, async (transaction) => {
-          const santaSnap = await transaction.get(santaDocRef);
-          if (!santaSnap.exists()) {
-            throw new Error("❌ Невірний код. Перевірте символи або зверніться до організатора.");
-          }
-
-          const santaData = santaSnap.data();
-          if (santaData.used && santaData.usedByUid !== currentUser.uid) {
-            throw new Error(
-              "❌ Цей персональний код вже був використаний на іншому пристрої! Якщо це були не ви — негайно напишіть організатору."
-            );
-          }
-
-          if (!santaData.receiverId) {
-            throw new Error("⚠️ Пари ще не сформовані. Зверніться до адміністратора.");
-          }
-
-          const receiverSnap = await transaction.get(receiverDocRef);
-          if (!receiverSnap.exists()) {
-            throw new Error("⚠️ Отримувача не знайдено у списку. Зверніться до адміністратора.");
-          }
-          const receiverData = receiverSnap.data();
-
-          // Оновлюємо статус коду в базі як використаний
-          transaction.update(santaDocRef, {
-            used: true,
-            usedAt: nowIso,
-            usedByUid: currentUser.uid
-          });
-
-          // Формуємо повний об'єкт сесії для миттєвого відображення і збереження за цим пристроєм
-          const sessionPayload = {
-            santaId: santaSnap.id,
-            santaName: santaData.fullName,
-            santaRole: santaData.role,
-            santaStore: santaData.storeNumber || "",
-            santaCode: santaData.code,
-            receiverId: receiverSnap.id,
-            receiverName: receiverData.fullName,
-            receiverRole: receiverData.role,
-            receiverStore: receiverData.storeNumber || "",
-            lockedAt: nowIso
-          };
-
-          transaction.set(lockDocRef, sessionPayload);
-          return sessionPayload;
-        });
-
-        // Миттєво записуємо в стан та перемикаємо на екран отримувача
-        lockedSession = createdSession;
-        inputEl.value = "";
-        launchConfetti();
-        showToast("Вітаємо! Ви стали Таємним Сантою 🎅🎁", "success");
-        routeActiveView();
-      } catch (err) {
-        console.error("Помилка активації коду:", err);
-        showCodeError(err.message || "Помилка при перевірці коду. Спробуйте ще раз.");
-      } finally {
-        submitBtn.disabled = false;
-        submitBtn.innerHTML = `<span>🎁 Дізнатися мого отримувача</span>`;
+      if (!matchedSanta.receiverId) {
+        showCodeError("⚠️ Пари ще не сформовані. Зверніться до адміністратора.");
+        return;
       }
+
+      const receiver = participants.find((p) => p.id === matchedSanta.receiverId);
+      if (!receiver) {
+        showCodeError("⚠️ Отримувача не знайдено у списку. Зверніться до адміністратора.");
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const updatedParticipants = [...participants];
+      updatedParticipants[santaIndex] = {
+        ...matchedSanta,
+        used: true,
+        usedAt: nowIso
+      };
+
+      const sessionPayload = {
+        santaId: matchedSanta.id,
+        santaName: matchedSanta.fullName,
+        santaRole: matchedSanta.role,
+        santaStore: matchedSanta.storeNumber || "",
+        santaCode: matchedSanta.code,
+        receiverId: receiver.id,
+        receiverName: receiver.fullName,
+        receiverRole: receiver.role,
+        receiverStore: receiver.storeNumber || "",
+        lockedAt: nowIso
+      };
+
+      saveDeviceLockToStorage(sessionPayload);
+      saveParticipantsToStorage(updatedParticipants);
+
+      inputEl.value = "";
+      launchConfetti();
+      showToast("Вітаємо! Ви стали Таємним Сантою 🎅🎁", "success");
+      routeActiveView();
     }
 
     // =========================================================================
-    // 7. РЕНДЕР ЗАБЛОКОВАНОГО ЕКРАНУ ОТРИМУВАЧА
+    // 7. LOCKED RECIPIENT SCREEN RENDERING
     // =========================================================================
     function renderLockedRecipientScreen(session) {
       document.getElementById("santa-greeting-name").textContent = session.santaName;
@@ -1233,13 +1121,12 @@
     }
 
     // =========================================================================
-    // 8. ПАНЕЛЬ АДМІНІСТРАТОРА (ПАРОЛЬ 5641301)
+    // 8. ADMIN DASHBOARD
     // =========================================================================
     function renderAdminDashboard() {
       const total = participants.length;
       const usedCount = participants.filter((p) => p.used).length;
 
-      // Аудит пар: перевіряємо чи є збіги сам із собою або відсутні отримувачі
       let selfMatches = 0;
       let missingReceivers = 0;
       const byId = new Map(participants.map((p) => [p.id, p]));
@@ -1322,7 +1209,6 @@
         tr.className = isSelfMatch ? "bg-red-50" : "hover:bg-gray-50/90 transition-colors";
 
         tr.innerHTML = `
-          <!-- 1. Хто дарує (Санта) -->
           <td class="py-3.5 px-4 align-top">
             <div class="font-bold text-gray-900">${escapeHtml(santa.fullName)}</div>
             <div class="text-xs font-semibold text-gray-500 mt-0.5">
@@ -1330,7 +1216,6 @@
             </div>
           </td>
 
-          <!-- 2. Персональний код + кнопки копіювання -->
           <td class="py-3.5 px-4 align-top">
             <div class="inline-block px-2.5 py-1 rounded-lg bg-amber-100 border border-amber-300 font-mono font-black text-amber-950 text-xs sm:text-sm tracking-wider">
               ${escapeHtml(santa.code)}
@@ -1355,7 +1240,6 @@
             </div>
           </td>
 
-          <!-- 3. Кому дарує (Отримувач) -->
           <td class="py-3.5 px-4 align-top">
             ${
               rec
@@ -1365,7 +1249,6 @@
             }
           </td>
 
-          <!-- 4. Статус та дії -->
           <td class="py-3.5 px-4 align-top">
             <div class="flex flex-col gap-2">
               <div>
@@ -1402,7 +1285,6 @@
           </td>
         `;
 
-        // Обробники кнопок рядка
         tr.querySelector('[data-action="copy-code"]').addEventListener("click", () => {
           copyTextToClipboard(santa.code, `Код ${santa.code} скопійовано! 📋`);
         });
@@ -1420,21 +1302,16 @@
           resetBtn.addEventListener("click", async () => {
             const confirmed = await openGenericConfirm(
               "🔄 Скинути статус коду?",
-              `Скинути статус використання для "${santa.fullName}" (${santa.code})? Людина зможе знову ввести свій код на іншому пристрої.`
+              `Скинути статус використання для "${santa.fullName}" (${santa.code})? Людина зможе знову ввести свій код.`
             );
             if (!confirmed) return;
 
-            try {
-              await updateDoc(doc(getParticipantsColRef(), santa.id), {
-                used: false,
-                usedAt: null,
-                usedByUid: null
-              });
-              showToast(`Статус коду ${santa.code} скинуто! ✅`, "success");
-            } catch (err) {
-              console.error(err);
-              showToast("Не вдалося скинути статус.", "error");
-            }
+            const updated = participants.map((p) =>
+              p.id === santa.id ? { ...p, used: false, usedAt: null } : p
+            );
+            saveParticipantsToStorage(updated);
+            renderAdminDashboard();
+            showToast(`Статус коду ${santa.code} скинуто! ✅`, "success");
           });
         }
 
@@ -1455,44 +1332,24 @@
               fullName
             }));
 
-          try {
-            await overwriteRosterWithSattolo(remaining, true);
-            showToast("Учасника видалено, пари безпечно перерозподілено ✅", "success");
-          } catch (err) {
-            console.error(err);
-            showToast("Помилка при видаленні учасника.", "error");
-          }
+          overwriteRosterWithSattolo(remaining, true);
+          renderAdminDashboard();
+          showToast("Учасника видалено, пари безпечно перерозподілено ✅", "success");
         });
 
         tbody.appendChild(tr);
       });
     }
 
-    // Повний перезапис списку з гарантованим жеребкуванням Саттоло
-    async function overwriteRosterWithSattolo(baseRoster, resetUsed = true) {
-      if (!currentUser) return;
+    function overwriteRosterWithSattolo(baseRoster, resetUsed = true) {
       const paired = generateSattoloDerangement(baseRoster, resetUsed);
-      const batch = writeBatch(db);
-
-      const newIds = new Set(paired.map((p) => p.id));
-      participants.forEach((oldItem) => {
-        if (!newIds.has(oldItem.id)) {
-          batch.delete(doc(getParticipantsColRef(), oldItem.id));
-        }
-      });
-
-      paired.forEach((p) => {
-        batch.set(doc(getParticipantsColRef(), p.id), p);
-      });
-
-      await batch.commit();
+      saveParticipantsToStorage(paired);
     }
 
     // =========================================================================
-    // 9. ПРИВ'ЯЗКА ПОДІЙ ІНТЕРФЕЙСУ
+    // 9. EVENT LISTENERS
     // =========================================================================
     function bindUIEvents() {
-      // Згортання/розгортання правил гри
       const toggleRulesBtn = document.getElementById("toggle-rules-btn");
       const rulesContent = document.getElementById("rules-content");
       const rulesChevron = document.getElementById("rules-chevron");
@@ -1501,7 +1358,6 @@
         rulesChevron.textContent = isHidden ? "Розгорнути ▼" : "Згорнути ▲";
       });
 
-      // Автоматичне очищення пробілів та переведення в верхній регістр під час вводу коду
       const codeInput = document.getElementById("secret-code-input");
       codeInput.addEventListener("input", () => {
         hideCodeError();
@@ -1512,16 +1368,13 @@
         } catch (_) {}
       });
 
-      // Відправка персонального коду
       document.getElementById("secret-code-form").addEventListener("submit", handleSecretCodeSubmit);
 
-      // Копіювання підпису посилки для ельфійки Світлани
       document.getElementById("copy-package-label-btn").addEventListener("click", () => {
         const label = document.getElementById("package-label-box").textContent.trim();
         copyTextToClipboard(label, "Підпис для посилки скопійовано! 🧝‍♀️📋");
       });
 
-      // --- МОДАЛКА ПАРОЛЯ АДМІНІСТРАТОРА (5641301) ---
       const adminModal = document.getElementById("modal-admin-password");
       const adminPassInput = document.getElementById("admin-password-input");
       const adminPassError = document.getElementById("admin-password-error");
@@ -1558,14 +1411,11 @@
         }
       });
 
-      // Вихід з адмін-панелі
       document.getElementById("exit-admin-btn").addEventListener("click", () => {
         isAdminAuthenticated = false;
         routeActiveView();
       });
 
-      // --- УТИЛІТИ АДМІНІСТРАТОРА ---
-      // 1. Перемішати пари заново (зберігаючи існуючих учасників та їхні коди)
       document.getElementById("admin-reshuffle-btn").addEventListener("click", async () => {
         if (participants.length < 2) {
           showToast("Потрібно щонайменше 2 учасники для формування пар.", "error");
@@ -1586,20 +1436,12 @@
           fullName
         }));
 
-        try {
-          await overwriteRosterWithSattolo(baseRoster, true);
-          if (currentUser) {
-            await deleteDoc(getDeviceLockDocRef(currentUser.uid)).catch(() => {});
-          }
-          lockedSession = null;
-          showToast("Пари успішно перемішано! 0 збігів сам із собою ✅", "success");
-        } catch (err) {
-          console.error(err);
-          showToast("Помилка при перемішуванні пар.", "error");
-        }
+        overwriteRosterWithSattolo(baseRoster, true);
+        saveDeviceLockToStorage(null);
+        renderAdminDashboard();
+        showToast("Пари успішно перемішано! 0 збігів сам із собою ✅", "success");
       });
 
-      // 2. Скопіювати всі коди списком
       document.getElementById("admin-copy-all-codes-btn").addEventListener("click", () => {
         if (participants.length === 0) {
           showToast("Список учасників порожній.", "error");
@@ -1612,20 +1454,11 @@
         copyTextToClipboard(header + lines.join("\n"), "Усі персональні коди скопійовано списком! 📋");
       });
 
-      // 3. Скинути блокування на цьому пристрої (для тестування адміном)
-      document.getElementById("admin-unlock-device-btn").addEventListener("click", async () => {
-        if (!currentUser) return;
-        try {
-          await deleteDoc(getDeviceLockDocRef(currentUser.uid));
-          lockedSession = null;
-          showToast("Блокування на цьому пристрої скинуто! Можете тестувати коди 🔓", "success");
-        } catch (err) {
-          console.error(err);
-          showToast("Не вдалося скинути блокування пристрою.", "error");
-        }
+      document.getElementById("admin-unlock-device-btn").addEventListener("click", () => {
+        saveDeviceLockToStorage(null);
+        showToast("Блокування на цьому пристрої скинуто! Можете тестувати коди 🔓", "success");
       });
 
-      // Вкладки адмінки
       const tabMasterBtn = document.getElementById("tab-master-btn");
       const tabAddBtn = document.getElementById("tab-add-btn");
       const tabMasterView = document.getElementById("admin-tab-master");
@@ -1645,11 +1478,9 @@
         tabMasterView.classList.add("hidden");
       });
 
-      // Пошук і фільтр в адмін-таблиці
       document.getElementById("admin-search-input").addEventListener("input", renderAdminMasterTable);
       document.getElementById("admin-status-filter").addEventListener("change", renderAdminMasterTable);
 
-      // Перемикач типу при додаванні одного учасника
       document.getElementById("add-role-select").addEventListener("change", (e) => {
         const isMgr = e.target.value === "manager";
         document.getElementById("add-store-col").classList.toggle("hidden", isMgr);
@@ -1658,8 +1489,7 @@
         document.getElementById("add-name-input").placeholder = isMgr ? "Ірина Миколаївна" : "Коваленко Олена";
       });
 
-      // Додавання одного учасника
-      document.getElementById("single-add-form").addEventListener("submit", async (e) => {
+      document.getElementById("single-add-form").addEventListener("submit", (e) => {
         e.preventDefault();
         const role = document.getElementById("add-role-select").value;
         const storeNumber = role === "store" ? normalizeStoreNumber(document.getElementById("add-store-input").value) : "";
@@ -1690,19 +1520,14 @@
           fullName
         });
 
-        try {
-          await overwriteRosterWithSattolo(baseRoster, true);
-          document.getElementById("add-name-input").value = "";
-          showToast(`Додано: ${fullName} (Код: ${newCode}). Пари оновлено! 🎄`, "success");
-          tabMasterBtn.click();
-        } catch (err) {
-          console.error(err);
-          showToast("Помилка при додаванні учасника.", "error");
-        }
+        overwriteRosterWithSattolo(baseRoster, true);
+        document.getElementById("add-name-input").value = "";
+        renderAdminDashboard();
+        showToast(`Додано: ${fullName} (Код: ${newCode}). Пари оновлено! 🎄`, "success");
+        tabMasterBtn.click();
       });
 
-      // Масовий імпорт списку
-      document.getElementById("bulk-import-submit-btn").addEventListener("click", async () => {
+      document.getElementById("bulk-import-submit-btn").addEventListener("click", () => {
         const rawText = document.getElementById("bulk-import-textarea").value.trim();
         if (!rawText) {
           showToast("Вставте список учасників у текстове поле.", "error");
@@ -1764,62 +1589,24 @@
           return;
         }
 
-        try {
-          await overwriteRosterWithSattolo(combined, true);
-          if (currentUser) {
-            await deleteDoc(getDeviceLockDocRef(currentUser.uid)).catch(() => {});
-          }
-          lockedSession = null;
-          document.getElementById("bulk-import-textarea").value = "";
-          showToast(`Імпортовано ${imported.length} учасників, згенеровано коди та пари! 🎅`, "success");
-          tabMasterBtn.click();
-        } catch (err) {
-          console.error(err);
-          showToast("Помилка при масовому імпорті.", "error");
-        }
+        overwriteRosterWithSattolo(combined, true);
+        saveDeviceLockToStorage(null);
+        document.getElementById("bulk-import-textarea").value = "";
+        renderAdminDashboard();
+        showToast(`Імпортовано ${imported.length} учасників, згенеровано коди та пари! 🎅`, "success");
+        tabMasterBtn.click();
       });
     }
 
     // =========================================================================
-    // 10. ТОЧКА ВХОДУ ДОДАТКУ
+    // 10. ENTRY POINT
     // =========================================================================
-    async function bootstrap() {
+    function bootstrap() {
       initSnowfall();
       bindUIEvents();
-
-      if (!firebaseConfig) {
-        showToast("Конфігурація бази даних недоступна.", "error");
-        return;
-      }
-
-      app = initializeApp(firebaseConfig);
-      auth = getAuth(app);
-      db = getFirestore(app);
-
-      // Крок 1: Спочатку обов'язкова автентифікація
-      try {
-        if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (authErr) {
-        console.error("Помилка автентифікації:", authErr);
-      }
-
-      onAuthStateChanged(auth, async (user) => {
-        if (!user) return;
-        currentUser = user;
-
-        // Перевіряємо, чи на цьому пристрої вже був активований код раніше
-        lockedSession = await loadDeviceLockFromFirestore();
-        if (lockedSession && lockedSession.receiverName) {
-          routeActiveView();
-        }
-
-        // Запускаємо синхронізацію бази учасників у реальному часі
-        startParticipantsListener();
-      });
+      loadDeviceLockFromStorage();
+      loadParticipantsFromStorage();
+      routeActiveView();
     }
 
     window.addEventListener("DOMContentLoaded", bootstrap);

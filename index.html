@@ -656,6 +656,7 @@
     </div>
   </div>
 
+  <!-- LocalStorage App Logic -->
   <script>
     // =========================================================================
     // 1. CONFIGURATION & LOCAL STORAGE KEYS
@@ -917,7 +918,6 @@
         console.error("Failed to read participants from localStorage:", err);
       }
 
-      // Seed initial sample data on first launch
       const seeded = generateSattoloDerangement(INITIAL_SAMPLE_PARTICIPANTS, true);
       saveParticipantsToStorage(seeded);
     }
